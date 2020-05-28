@@ -370,6 +370,7 @@ class Generator(nn.Module):
         style_dim,
         n_mlp,
         channel_multiplier=2,
+        channel_multiplier_enc=1,
         blur_kernel=[1, 3, 3, 1],
         lr_mlp=0.01,
     ):
@@ -402,7 +403,7 @@ class Generator(nn.Module):
             1024: 16 * channel_multiplier,
         }
 
-        self.input = ConstantInput(self.channels[4])
+        # self.input = ConstantInput(self.channels[4])
         self.conv1 = StyledConv(
             self.channels[4], self.channels[4], 3, style_dim, blur_kernel=blur_kernel
         )
@@ -449,8 +450,10 @@ class Generator(nn.Module):
 
         self.n_latent = self.log_size * 2 - 2
 
+        self.encoder = Encoder(64, channel_multiplier_enc)
+
     def make_noise(self):
-        device = self.input.input.device
+        device = self.conv1.noise.weight.device
 
         noises = [torch.randn(1, 1, 2 ** 2, 2 ** 2, device=device)]
 
@@ -473,6 +476,7 @@ class Generator(nn.Module):
 
     def forward(
         self,
+        input,
         styles,
         return_latents=False,
         inject_index=None,
@@ -521,7 +525,8 @@ class Generator(nn.Module):
 
             latent = torch.cat([latent, latent2], 1)
 
-        out = self.input(latent)
+        # out = self.input(latent)
+        out = self.encoder(input)
         out = self.conv1(out, latent[:, 0], noise=noise[0])
 
         skip = self.to_rgb1(out, latent[:, 1])
@@ -530,6 +535,7 @@ class Generator(nn.Module):
         for conv1, conv2, noise1, noise2, to_rgb in zip(
             self.convs[::2], self.convs[1::2], noise[1::2], noise[2::2], self.to_rgbs
         ):
+            # TODO: try to encode here from noise
             out = conv1(out, latent[:, i], noise=noise1)
             out = conv2(out, latent[:, i + 1], noise=noise2)
             skip = to_rgb(out, latent[:, i + 2], skip)
@@ -631,7 +637,7 @@ class Discriminator(nn.Module):
             1024: 16 * channel_multiplier,
         }
 
-        convs = [ConvLayer(3, channels[size], 1)]
+        convs = [ConvLayer(4, channels[size], 1)]
 
         log_size = int(math.log(size, 2))
 
@@ -655,8 +661,10 @@ class Discriminator(nn.Module):
             EqualLinear(channels[4], 1),
         )
 
-    def forward(self, input):
-        out = self.convs(input)
+    def forward(self, label, input):
+        label = F.interpolate(label, scale_factor=4)
+        out = torch.cat([label, input], 1)
+        out = self.convs(out)
 
         batch, channel, height, width = out.shape
         group = min(batch, self.stddev_group)
@@ -673,5 +681,35 @@ class Discriminator(nn.Module):
         out = out.view(batch, -1)
         out = self.final_linear(out)
 
+        return out
+
+
+class Encoder(nn.Module):
+    def __init__(self, size, channel_multiplier=1, blur_kernel=[1, 3, 3, 1]):
+        super().__init__()
+
+        channels = {
+            4: 512,
+            8: 256,
+            16: 128,
+            32: 64,
+            64: 32 * channel_multiplier,
+        }
+
+        convs = [ConvLayer(1, channels[size], 1)]
+        log_size = int(math.log(size, 2))
+        in_channel = channels[size]
+
+        for i in range(log_size, 2, -1):
+            out_channel = channels[2 ** (i - 1)]
+
+            convs.append(ResBlock(in_channel, out_channel, blur_kernel))
+
+            in_channel = out_channel
+
+        self.convs = nn.Sequential(*convs)
+
+    def forward(self, input):
+        out = self.convs(input)
         return out
 

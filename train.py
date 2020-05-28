@@ -150,6 +150,12 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
     sample_z = torch.randn(args.n_sample, args.latent, device=device)
 
+    sample_labels = []
+    while len(sample_labels) < args.n_sample:
+        real_img, real_label = next(loader)
+        sample_labels.append(real_label.to(device))
+    sample_labels = torch.cat(sample_labels, 0)[:args.n_sample]
+
     for idx in pbar:
         i = idx + args.start_iter
 
@@ -158,17 +164,18 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
             break
 
-        real_img = next(loader)
+        real_img, real_label = next(loader)
         real_img = real_img.to(device)
+        real_label = real_label.to(device)
 
         requires_grad(generator, False)
         requires_grad(discriminator, True)
 
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        fake_img, _ = generator(noise)
-        fake_pred = discriminator(fake_img)
+        fake_img, _ = generator(real_label, noise)
+        fake_pred = discriminator(real_label, fake_img)
 
-        real_pred = discriminator(real_img)
+        real_pred = discriminator(real_label, real_img)
         d_loss = d_logistic_loss(real_pred, fake_pred)
 
         loss_dict['d'] = d_loss
@@ -183,7 +190,7 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
 
         if d_regularize:
             real_img.requires_grad = True
-            real_pred = discriminator(real_img)
+            real_pred = discriminator(real_label, real_img)
             r1_loss = d_r1_loss(real_pred, real_img)
 
             discriminator.zero_grad()
@@ -197,8 +204,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
         requires_grad(discriminator, False)
 
         noise = mixing_noise(args.batch, args.latent, args.mixing, device)
-        fake_img, _ = generator(noise)
-        fake_pred = discriminator(fake_img)
+        fake_img, _ = generator(real_label, noise)
+        fake_pred = discriminator(real_label, fake_img)
         g_loss = g_nonsaturating_loss(fake_pred)
 
         loss_dict['g'] = g_loss
@@ -214,7 +221,8 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
             noise = mixing_noise(
                 path_batch_size, args.latent, args.mixing, device
             )
-            fake_img, latents = generator(noise, return_latents=True)
+            fake_img, latents = generator(real_label[:path_batch_size], noise,
+                                          return_latents=True)
 
             path_loss, mean_path_length, path_lengths = g_path_regularize(
                 fake_img, latents, mean_path_length
@@ -271,10 +279,10 @@ def train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, devic
                     }
                 )
 
-            if i % 100 == 0:
+            if i % 200 == 0:
                 with torch.no_grad():
                     g_ema.eval()
-                    sample, _ = g_ema([sample_z])
+                    sample, _ = g_ema(sample_labels, [sample_z])
                     utils.save_image(
                         sample,
                         f'sample/{str(i).zfill(6)}.png',
@@ -303,7 +311,7 @@ if __name__ == '__main__':
 
     parser.add_argument('path', type=str)
     parser.add_argument('--iter', type=int, default=800000)
-    parser.add_argument('--batch', type=int, default=16)
+    parser.add_argument('--batch', type=int, default=8)
     parser.add_argument('--n_sample', type=int, default=64)
     parser.add_argument('--size', type=int, default=256)
     parser.add_argument('--r1', type=float, default=10)
@@ -393,16 +401,23 @@ if __name__ == '__main__':
             broadcast_buffers=False,
         )
 
-
     transform = transforms.Compose(
         [
-            transforms.RandomHorizontalFlip(),
             transforms.ToTensor(),
-            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5), inplace=True),
+            transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5),
+                                 inplace=True),
         ]
     )
 
-    dataset = MultiResolutionDataset(args.path, transform, args.size)
+    transform_label = transforms.Compose(
+        [
+            transforms.ToTensor(),
+            transforms.Normalize((0.5,), (0.5,), inplace=True),
+        ]
+    )
+
+    dataset = MultiResolutionDataset(args.path, transform, transform_label,
+                                     args.size)
     loader = data.DataLoader(
         dataset,
         batch_size=args.batch,
@@ -413,4 +428,5 @@ if __name__ == '__main__':
     if get_rank() == 0 and wandb is not None and args.wandb:
         wandb.init(project='stylegan 2')
 
-    train(args, loader, generator, discriminator, g_optim, d_optim, g_ema, device)
+    train(args, loader, generator, discriminator, g_optim, d_optim, g_ema,
+          device)

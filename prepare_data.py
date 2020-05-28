@@ -29,29 +29,46 @@ def resize_multiple(img, sizes=(128, 256, 512, 1024), resample=Image.LANCZOS, qu
     return imgs
 
 
-def resize_worker(img_file, sizes, resample):
-    i, file = img_file
-    img = Image.open(file)
+def resize_worker(img_label_file, sizes, resample, mask_size):
+    img_file, label_file = img_label_file
+    i, img_file = img_file
+    _, label_file = label_file
+
+    img = Image.open(img_file)
     img = img.convert('RGB')
     out = resize_multiple(img, sizes=sizes, resample=resample)
 
-    return i, out
+    label = Image.open(label_file)
+    label = resize_and_convert(label, mask_size, resample=resample)
+
+    return i, out, label
 
 
-def prepare(env, dataset, n_worker, sizes=(128, 256, 512, 1024), resample=Image.LANCZOS):
-    resize_fn = partial(resize_worker, sizes=sizes, resample=resample)
+def prepare(env, dataset, n_worker, sizes=(128, 256, 512, 1024),
+            resample=Image.LANCZOS, mask_size=64):
+    resize_fn = partial(resize_worker, sizes=sizes, resample=resample,
+                        mask_size=mask_size)
 
     files = sorted(dataset.imgs, key=lambda x: x[0])
-    files = [(i, file) for i, (file, label) in enumerate(files)]
+    files_img = [(i, file) for i, (file, label) in enumerate(files) if 'img'
+                 in file]
+    files_label = [(i, file) for i, (file, label) in enumerate(files) if 'label'
+                   in file]
+    files_img_label = list(zip(files_img, files_label))
     total = 0
 
     with multiprocessing.Pool(n_worker) as pool:
-        for i, imgs in tqdm(pool.imap_unordered(resize_fn, files)):
+        for i, imgs, label in tqdm(pool.imap_unordered(resize_fn,
+                                                       files_img_label)):
             for size, img in zip(sizes, imgs):
                 key = f'{size}-{str(i).zfill(5)}'.encode('utf-8')
 
                 with env.begin(write=True) as txn:
                     txn.put(key, img)
+
+            with env.begin(write=True) as txn:
+                key = f'label-{str(i).zfill(5)}'.encode('utf-8')
+                txn.put(key, label)
 
             total += 1
 

@@ -637,10 +637,11 @@ class Discriminator(nn.Module):
             1024: 16 * channel_multiplier,
         }
 
+
         convs = [ConvLayer(4, channels[size], 1)]
 
+        self.size = size
         log_size = int(math.log(size, 2))
-
         in_channel = channels[size]
 
         for i in range(log_size, 2, -1):
@@ -662,7 +663,7 @@ class Discriminator(nn.Module):
         )
 
     def forward(self, label, input):
-        label = F.interpolate(label, scale_factor=4)
+        label = F.interpolate(label, size=self.size)
         out = torch.cat([label, input], 1)
         out = self.convs(out)
 

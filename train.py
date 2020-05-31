@@ -325,7 +325,9 @@ if __name__ == '__main__':
     parser.add_argument('--channel_multiplier', type=int, default=2)
     parser.add_argument('--wandb', action='store_true')
     parser.add_argument('--local_rank', type=int, default=0)
-
+    parser.add_argument('--conditional_architecture', type=str, default='base',
+                        choices=['base', 'enc', 'spade'])
+    parser.add_argument('--spade_max_resolution', type=int, default=64)
     args = parser.parse_args()
 
     n_gpu = int(os.environ['WORLD_SIZE']) if 'WORLD_SIZE' in os.environ else 1
@@ -342,13 +344,19 @@ if __name__ == '__main__':
     args.start_iter = 0
 
     generator = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
+        args.size, args.latent, args.n_mlp,
+        channel_multiplier=args.channel_multiplier,
+        architecture=args.conditional_architecture,
+        spade_max_resolution=args.spade_max_resolution
     ).to(device)
     discriminator = Discriminator(
         args.size, channel_multiplier=args.channel_multiplier
     ).to(device)
     g_ema = Generator(
-        args.size, args.latent, args.n_mlp, channel_multiplier=args.channel_multiplier
+        args.size, args.latent, args.n_mlp,
+        channel_multiplier=args.channel_multiplier,
+        architecture=args.conditional_architecture,
+        spade_max_resolution=args.spade_max_resolution
     ).to(device)
     g_ema.eval()
     accumulate(g_ema, generator, 0)
@@ -392,6 +400,7 @@ if __name__ == '__main__':
             device_ids=[args.local_rank],
             output_device=args.local_rank,
             broadcast_buffers=False,
+            find_unused_parameters=True
         )
 
         discriminator = nn.parallel.DistributedDataParallel(
@@ -399,6 +408,7 @@ if __name__ == '__main__':
             device_ids=[args.local_rank],
             output_device=args.local_rank,
             broadcast_buffers=False,
+            find_unused_parameters=True
         )
 
     transform = transforms.Compose(

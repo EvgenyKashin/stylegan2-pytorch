@@ -314,6 +314,7 @@ class StyledConv(nn.Module):
         upsample=False,
         blur_kernel=[1, 3, 3, 1],
         demodulate=True,
+        is_spade=False,
     ):
         super().__init__()
 
@@ -327,14 +328,20 @@ class StyledConv(nn.Module):
             demodulate=demodulate,
         )
 
+        self.is_spade = is_spade
+        if is_spade:
+            self.spade = SPADE(norm_nc=out_channel, label_nc=1)
         self.noise = NoiseInjection()
-        # self.bias = nn.Parameter(torch.zeros(1, out_channel, 1, 1))
-        # self.activate = ScaledLeakyReLU(0.2)
         self.activate = FusedLeakyReLU(out_channel)
 
-    def forward(self, input, style, noise=None):
+    def forward(self, input, style, noise=None, spade=None):
         out = self.conv(input, style)
-        out = self.noise(out, noise=noise)
+
+        if self.is_spade:
+            out = self.spade(out, spade)
+        else:
+            out = self.noise(out, noise)
+
         # out = out + self.bias
         out = self.activate(out)
 
@@ -373,11 +380,13 @@ class Generator(nn.Module):
         channel_multiplier_enc=1,
         blur_kernel=[1, 3, 3, 1],
         lr_mlp=0.01,
+        architecture='base',
+        spade_max_resolution=64
     ):
         super().__init__()
 
         self.size = size
-
+        self.architecture = architecture
         self.style_dim = style_dim
 
         layers = [PixelNorm()]
@@ -403,9 +412,13 @@ class Generator(nn.Module):
             1024: 16 * channel_multiplier,
         }
 
-        # self.input = ConstantInput(self.channels[4])
+        if self.architecture != 'enc':
+            self.input = ConstantInput(self.channels[4])
+
+        # segmap will be too small for applying on 4x4 resolution - not spade
         self.conv1 = StyledConv(
-            self.channels[4], self.channels[4], 3, style_dim, blur_kernel=blur_kernel
+            self.channels[4], self.channels[4], 3, style_dim,
+            blur_kernel=blur_kernel, is_spade=False
         )
         self.to_rgb1 = ToRGB(self.channels[4], style_dim, upsample=False)
 
@@ -426,6 +439,8 @@ class Generator(nn.Module):
 
         for i in range(3, self.log_size + 1):
             out_channel = self.channels[2 ** i]
+            is_spade = self.architecture == 'spade' and \
+                2 ** i <= spade_max_resolution
 
             self.convs.append(
                 StyledConv(
@@ -435,12 +450,15 @@ class Generator(nn.Module):
                     style_dim,
                     upsample=True,
                     blur_kernel=blur_kernel,
+                    is_spade=is_spade
                 )
             )
 
             self.convs.append(
                 StyledConv(
-                    out_channel, out_channel, 3, style_dim, blur_kernel=blur_kernel
+                    out_channel, out_channel, 3, style_dim,
+                    blur_kernel=blur_kernel,
+                    is_spade=is_spade
                 )
             )
 
@@ -450,10 +468,11 @@ class Generator(nn.Module):
 
         self.n_latent = self.log_size * 2 - 2
 
-        self.encoder = Encoder(64, channel_multiplier_enc)
+        if self.architecture == 'enc':
+            self.encoder = Encoder(64, channel_multiplier_enc)
 
     def make_noise(self):
-        device = self.conv1.noise.weight.device
+        device = self.conv1.conv.weight.device
 
         noises = [torch.randn(1, 1, 2 ** 2, 2 ** 2, device=device)]
 
@@ -474,6 +493,11 @@ class Generator(nn.Module):
     def get_latent(self, input):
         return self.style(input)
 
+    def make_spade_input(self, seg):
+        device = self.conv1.conv.weight.device
+        seg = seg.to(device)
+        return seg
+
     def forward(
         self,
         input,
@@ -488,6 +512,11 @@ class Generator(nn.Module):
     ):
         if not input_is_latent:
             styles = [self.style(s) for s in styles]
+
+        if self.architecture == 'spade':
+            spade_input = self.make_spade_input(input)
+        else:
+            spade_input = None
 
         if noise is None:
             if randomize_noise:
@@ -525,19 +554,22 @@ class Generator(nn.Module):
 
             latent = torch.cat([latent, latent2], 1)
 
-        # out = self.input(latent)
-        out = self.encoder(input)
-        out = self.conv1(out, latent[:, 0], noise=noise[0])
+        if self.architecture == 'enc':
+            out = self.encoder(input)
+        else:
+            out = self.input(latent)
+
+        out = self.conv1(out, latent[:, 0], noise=noise[0], spade=spade_input)
 
         skip = self.to_rgb1(out, latent[:, 1])
 
         i = 1
         for conv1, conv2, noise1, noise2, to_rgb in zip(
-            self.convs[::2], self.convs[1::2], noise[1::2], noise[2::2], self.to_rgbs
+            self.convs[::2], self.convs[1::2], noise[1::2], noise[2::2],
+            self.to_rgbs
         ):
-            # TODO: try to encode here from noise
-            out = conv1(out, latent[:, i], noise=noise1)
-            out = conv2(out, latent[:, i + 1], noise=noise2)
+            out = conv1(out, latent[:, i], noise=noise1, spade=spade_input)
+            out = conv2(out, latent[:, i + 1], noise=noise2, spade=spade_input)
             skip = to_rgb(out, latent[:, i + 2], skip)
 
             i += 2
@@ -714,3 +746,29 @@ class Encoder(nn.Module):
         out = self.convs(input)
         return out
 
+
+class SPADE(nn.Module):
+    def __init__(self, norm_nc, label_nc):
+        super().__init__()
+
+        self.norm = nn.InstanceNorm2d(norm_nc)
+        nhidden = 64
+
+        self.mlp_shared = nn.Sequential(
+            nn.Conv2d(label_nc, nhidden, kernel_size=3, padding=1),
+            nn.ReLU()
+        )
+
+        self.mlp_gamma = nn.Conv2d(nhidden, norm_nc, kernel_size=3, padding=1)
+        self.mlp_beta = nn.Conv2d(nhidden, norm_nc, kernel_size=3, padding=1)
+
+    def forward(self, x, segmap):
+        normalized = self.norm(x)
+
+        segmap = F.interpolate(segmap, size=x.size()[2:], mode='nearest')
+        actv = self.mlp_shared(segmap)
+        gamma = self.mlp_gamma(actv)
+        beta = self.mlp_beta(actv)
+
+        out = normalized * (1 + gamma) + beta
+        return out
